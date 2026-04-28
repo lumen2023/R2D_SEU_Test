@@ -1,181 +1,251 @@
-act_entropy: 3e-4
-kl_free: 1.0
-imag_horizon: 15
-horizon: 333
-lamb: 0.95
-compile: True
-log_grads: False
-device: ${device}
-rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+# ============================================================================
+# R2-Dreamer 模型基础配置文件 (_base_.yaml)
+# 
+# 本文件定义了 R2-Dreamer 强化学习算法的核心超参数和架构配置。
+# R2-Dreamer 是一种无需解码器或数据增强的冗余减少世界模型。
+# ============================================================================
 
-lr: 4e-5
-agc: 0.3
-pmin: 1e-3
-eps: 1e-20
-beta1: 0.9
-beta2: 0.999
-warmup: 1000
-slow_target_update: 1
-slow_target_fraction: 0.02
+# ----------------------------------------------------------------------------
+# 核心训练超参数
+# ----------------------------------------------------------------------------
+act_entropy: 3e-4           # 策略熵正则化系数，用于鼓励探索（越大越随机）
+kl_free: 1.0                # KL 散度的自由比特阈值，防止后验坍缩
+imag_horizon: 15            # 想象轨迹的 rollout 长度（在潜在空间中模拟的未来步数）
+horizon: 333                # 环境episode的最大步数限制
+lamb: 0.95                  # TD(λ) 中的 λ 参数，用于平衡偏差和方差
+compile: True               # 是否使用 PyTorch 2.0 的 torch.compile 加速
+log_grads: False            # 是否在 TensorBoard 中记录梯度统计信息
+device: ${device}           # 计算设备（cuda/cpu），从全局配置继承
+rep_loss: "r2dreamer"       # 表征学习损失函数类型，可选值：
+                            #   - r2dreamer: 基于互相关矩阵的冗余减少方法（无解码器）
+                            #   - dreamer: 传统 Dreamer 的重构损失（需要解码器）
+                            #   - infonce: InfoNCE 对比学习损失
+                            #   - dreamerpro: DreamerPro 原型学习方法
 
+# ----------------------------------------------------------------------------
+# 优化器配置 (LaProp 优化器 + AGC 梯度裁剪)
+# ----------------------------------------------------------------------------
+lr: 4e-5                    # 学习率
+agc: 0.3                    # 自适应梯度裁剪 (Adaptive Gradient Clipping) 系数
+pmin: 1e-3                  # 优化器中最小概率阈值（防止数值不稳定）
+eps: 1e-20                  # 数值稳定性常数，避免除零错误
+beta1: 0.9                  # Adam/LaProp 优化器的一阶矩估计衰减率
+beta2: 0.999                # Adam/LaProp 优化器的二阶矩估计衰减率
+warmup: 1000                # 学习率预热步数，前 1000 步线性增加学习率
+slow_target_update: 1       # 慢目标网络更新频率（每 N 步更新一次）
+slow_target_fraction: 0.02  # 慢目标网络的 EMA 更新系数 τ（软更新比例）
+
+# ----------------------------------------------------------------------------
+# 损失函数权重配置
+# 这些系数控制各个损失项在总损失中的相对重要性
+# ----------------------------------------------------------------------------
 loss_scales:
-  barlow: 0.05
-  infonce: 1.0
-  recon: 1.0
-  rew: 1.0
-  con: 1.0
-  dyn: 1.0
-  rep: 0.1
-  policy: 1.0
-  value: 1.0
-  repval: 0.3
-  swav: 1.0
-  temp: 1.0
-  norm: 1.0
+  barlow: 0.05              # Barlow Twins 损失权重（R2-Dreamer 的互相关矩阵损失）
+  infonce: 1.0              # InfoNCE 对比学习损失权重
+  recon: 1.0                # 重构损失权重（仅在 dreamer 模式下使用）
+  rew: 1.0                  # 奖励预测损失权重
+  con: 1.0                  # 终止信号（continuation）预测损失权重
+  dyn: 1.0                  # 动力学模型损失权重（先验与后验的 KL 散度）
+  rep: 0.1                  # 表征学习损失权重（编码器输出的正则化）
+  policy: 1.0               # 策略（Actor）损失权重
+  value: 1.0                # 价值（Critic）损失权重
+  repval: 0.3               # 表征价值一致性损失权重
+  swav: 1.0                 # SwAV 自监督学习损失权重
+  temp: 1.0                 # 温度参数损失权重
+  norm: 1.0                 # 归一化损失权重
 
+# ----------------------------------------------------------------------------
+# R2-Dreamer 特定配置
+# ----------------------------------------------------------------------------
 r2dreamer:
-  lambd: 5e-4
+  lambd: 5e-4               # R2-Dreamer 的正则化参数 λ，控制互相关矩阵对角线与非对角线的平衡
 
+# ----------------------------------------------------------------------------
+# DreamerPro 特定配置（基于原型的学习方法）
+# ----------------------------------------------------------------------------
 dreamer_pro:
-  warm_up: 1
-  num_prototypes: 2500
-  proto_dim: 32
-  temperature: 0.1
-  sinkhorn_eps: 0.05
-  sinkhorn_iters: 3
-  ema_update_every: 1
-  ema_update_fraction: 0.05
-  freeze_prototypes_iters: 10000
-  aug:
-    max_delta: 3.0
-    same_across_time: True
-    bilinear: True
+  warm_up: 1                # 预热期，在此阶段不更新原型
+  num_prototypes: 2500      # 原型（prototypes）的数量
+  proto_dim: 32             # 每个原型的维度
+  temperature: 0.1          # Softmax 温度参数，控制分配的尖锐程度
+  sinkhorn_eps: 0.05        # Sinkhorn-Knopp 算法的 epsilon 参数（用于最优传输）
+  sinkhorn_iters: 3         # Sinkhorn 迭代次数
+  ema_update_every: 1       # EMA 更新频率（每 N 步更新一次原型）
+  ema_update_fraction: 0.05 # EMA 更新的比例系数
+  freeze_prototypes_iters: 10000  # 冻结原型的迭代次数（防止早期崩溃）
+  aug:                      # 数据增强配置
+    max_delta: 3.0          # 最大扰动幅度
+    same_across_time: True  # 是否在时间维度上应用相同的增强
+    bilinear: True          # 是否使用双线性插值
 
+# ----------------------------------------------------------------------------
+# RSSM (Recurrent State Space Model) 循环状态空间模型配置
+# RSSM 是 Dreamer 系列的世界模型核心，结合确定性状态和随机性状态
+# ----------------------------------------------------------------------------
 rssm:
-  stoch: 32
-  deter: ${model.deter}
-  hidden: ${model.hidden}
-  discrete: ${model.discrete}
-  img_layers: 2
-  obs_layers: 1
-  dyn_layers: 1
-  blocks: 8
-  act: ${model.act}
-  norm: ${model.norm}
-  unimix_ratio: 0.01
-  initial: 'learned'
-  device: ${device}
+  stoch: 32                 # 随机状态（stochastic state）的离散类别数量 K
+  deter: ${model.deter}     # 确定性状态（deterministic state）的维度 h_t（GRU 隐藏层大小）
+  hidden: ${model.hidden}   # RSSM 内部隐藏层的维度
+  discrete: ${model.discrete}  # 是否使用离散潜在变量（True=离散, False=连续）
+  img_layers: 2             # 想象路径（imagination path）的 MLP 层数
+  obs_layers: 1             # 观测编码路径的 MLP 层数
+  dyn_layers: 1             # 动力学模型（transition model）的 MLP 层数
+  blocks: 8                 # ResNet 风格的残差块数量
+  act: ${model.act}         # 激活函数类型（如 SiLU、ReLU 等）
+  norm: ${model.norm}       # 归一化方法（如 LayerNorm、RMSNorm 等）
+  unimix_ratio: 0.01        # 均匀分布混合比例，用于离散动作空间的探索
+  initial: 'learned'        # 初始状态初始化方式：'learned'（可学习）或 'zeros'
+  device: ${device}         # 计算设备
 
+# ----------------------------------------------------------------------------
+# Encoder 编码器配置
+# 将原始观测（图像/状态）编码为低维嵌入向量
+# ----------------------------------------------------------------------------
 encoder:
-  mlp_keys: ${env.encoder.mlp_keys}
-  cnn_keys: ${env.encoder.cnn_keys}
+  mlp_keys: ${env.encoder.mlp_keys}  # 需要通过 MLP 编码的观测键（如 proprioception 本体感知）
+  cnn_keys: ${env.encoder.cnn_keys}  # 需要通过 CNN 编码的观测键（如图像 pixels）
+  
+  # MLP 编码器配置（用于处理向量型观测）
   mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
-    device: ${device}
-    outscale: null
-    symlog_inputs: True
-    name: 'mlp_encoder'
+    shape: null               # 输入形状（自动推断）
+    layers: 3                 # MLP 层数
+    units: ${model.units}     # 每层的神经元数量
+    act: ${model.act}         # 激活函数
+    norm: ${model.norm}       # 归一化方法
+    device: ${device}         # 计算设备
+    outscale: null            # 输出层权重缩放因子（null 表示默认）
+    symlog_inputs: True       # 是否对输入应用对称对数变换 symlog(x) = sign(x) * log(|x| + 1)
+    name: 'mlp_encoder'       # 模块名称
+  
+  # CNN 编码器配置（用于处理图像观测）
   cnn:
-    act: ${model.act}
-    norm: ${model.norm}
-    kernel_size: 5
-    minres: 4
-    depth: ${model.depth}
-    mults: [2, 3, 4, 4]
+    act: ${model.act}         # 激活函数
+    norm: ${model.norm}       # 归一化方法
+    kernel_size: 5            # 卷积核大小
+    minres: 4                 # 最小特征图分辨率（停止下采样的阈值）
+    depth: ${model.depth}     # 基础卷积通道数
+    mults: [2, 3, 4, 4]      # 每层通道数的倍增系数（相对于 depth）
 
+# ----------------------------------------------------------------------------
+# Decoder 解码器配置
+# 将潜在状态解码回观测空间（仅在 dreamer 模式下使用，R2-Dreamer 不需要）
+# ----------------------------------------------------------------------------
 decoder:
-  mlp_keys: ${env.decoder.mlp_keys}
-  cnn_keys: ${env.decoder.cnn_keys}
+  mlp_keys: ${env.decoder.mlp_keys}  # 需要通过 MLP 解码的观测键
+  cnn_keys: ${env.decoder.cnn_keys}  # 需要通过 CNN 解码的观测键
+  
+  # 输出分布配置
   mlp_dist:
-    name: 'symlog_mse'
+    name: 'symlog_mse'        # MLP 输出的距离度量（对称对数 MSE）
   cnn_dist:
-    name: 'mse'
+    name: 'mse'               # CNN 输出的距离度量（标准 MSE）
+  
+  # MLP 解码器配置
   mlp:
-    shape: null
-    layers: 3
-    units: ${model.units}
-    act: ${model.act}
-    norm: ${model.norm}
+    shape: null               # 输出形状（自动推断）
+    layers: 3                 # MLP 层数
+    units: ${model.units}     # 每层的神经元数量
+    act: ${model.act}         # 激活函数
+    norm: ${model.norm}       # 归一化方法
     dist:
-      name: 'identity'
-    device: ${device}
-    outscale: 1.0
-    symlog_inputs: False
-    name: 'mlp_decoder'
+      name: 'identity'        # 输出分布类型（identity 表示直接输出）
+    device: ${device}         # 计算设备
+    outscale: 1.0             # 输出层权重缩放因子
+    symlog_inputs: False      # 是否对输入应用对称对数变换
+    name: 'mlp_decoder'       # 模块名称
+  
+  # CNN 解码器配置（转置卷积上采样）
   cnn:
-    depth: ${model.depth}
-    units: ${model.units}
-    bspace: 8
-    mults: [2, 3, 4, 4]
-    act: ${model.act}
-    norm: ${model.norm}
-    kernel_size: 5
-    minres: 4
-    outscale: 1.0
+    depth: ${model.depth}     # 基础卷积通道数
+    units: ${model.units}     # 神经元数量
+    bspace: 8                 # 批归一化的空间分组数
+    mults: [2, 3, 4, 4]      # 每层通道数的倍增系数
+    act: ${model.act}         # 激活函数
+    norm: ${model.norm}       # 归一化方法
+    kernel_size: 5            # 卷积核大小
+    minres: 4                 # 最小特征图分辨率
+    outscale: 1.0             # 输出层权重缩放因子
 
+# ----------------------------------------------------------------------------
+# Reward Head 奖励预测头配置
+# 从潜在状态预测即时奖励 r_t
+# ----------------------------------------------------------------------------
 reward:
-  shape: [255,]
-  layers: 1
-  units: ${model.units}
-  act: ${model.act}
-  norm: ${model.norm}
+  shape: [255,]               # TwoHot 分布的 bin 数量（255 个离散区间）
+  layers: 1                   # MLP 层数
+  units: ${model.units}       # 每层的神经元数量
+  act: ${model.act}           # 激活函数
+  norm: ${model.norm}         # 归一化方法
   dist:
-    name: 'symexp_twohot'
-    bin_num: 255
-  outscale: 0.0
-  device: ${device}
-  symlog_inputs: False
-  name: 'reward'
+    name: 'symexp_twohot'     # 分布类型：对称指数变换的 TwoHot 分布
+                              # 适合预测具有长尾分布的奖励信号
+    bin_num: 255              # TwoHot 的 bin 数量
+  outscale: 0.0               # 输出层权重缩放因子（0 表示小初始化）
+  device: ${device}           # 计算设备
+  symlog_inputs: False        # 是否对输入应用对称对数变换
+  name: 'reward'              # 模块名称
 
+# ----------------------------------------------------------------------------
+# Continuation Head 终止信号预测头配置
+# 预测 episode 是否继续（二元分类：继续/终止）
+# ----------------------------------------------------------------------------
 cont:
-  shape: [1,]
-  layers: 1
-  units: ${model.units}
-  act: ${model.act}
-  norm: ${model.norm}
+  shape: [1,]                 # 输出维度（二元分类）
+  layers: 1                   # MLP 层数
+  units: ${model.units}       # 每层的神经元数量
+  act: ${model.act}           # 激活函数
+  norm: ${model.norm}         # 归一化方法
   dist:
-    name: 'binary'
-  outscale: 1.0
-  device: ${device}
-  symlog_inputs: False
-  name: 'cont'
+    name: 'binary'            # 二元伯努利分布
+  outscale: 1.0               # 输出层权重缩放因子
+  device: ${device}           # 计算设备
+  symlog_inputs: False        # 是否对输入应用对称对数变换
+  name: 'cont'                # 模块名称
 
+# ----------------------------------------------------------------------------
+# Actor 策略网络配置
+# 根据潜在状态输出动作分布 π(a|s)
+# ----------------------------------------------------------------------------
 actor:
-  shape: null
-  layers: 3
-  units: ${model.units}
-  act: ${model.act}
-  norm: ${model.norm}
-  device: ${device}
+  shape: null                 # 动作空间维度（根据环境自动推断）
+  layers: 3                   # MLP 层数
+  units: ${model.units}       # 每层的神经元数量
+  act: ${model.act}           # 激活函数
+  norm: ${model.norm}         # 归一化方法
+  device: ${device}           # 计算设备
+  
+  # 动作分布配置（支持连续和离散动作空间）
   dist:
-    cont:
-      name: 'bounded_normal'
-      min_std: 0.1
-      max_std: 1.0
-    disc:
-      name: 'onehot'
-      unimix_ratio: 0.01
-    multi_disc:
-      name: 'multi_onehot'
-      unimix_ratio: 0.01
-  outscale: 0.01
-  symlog_inputs: False
-  name: 'actor'
+    cont:                     # 连续动作空间配置
+      name: 'bounded_normal'  # 有界高斯分布（通过 tanh 约束到 [-1, 1]）
+      min_std: 0.1            # 最小标准差（防止过早收敛到确定性策略）
+      max_std: 1.0            # 最大标准差
+    disc:                     # 离散动作空间配置
+      name: 'onehot'          # One-hot 分类分布
+      unimix_ratio: 0.01      # 均匀分布混合比例（鼓励探索）
+    multi_disc:               # 多维离散动作空间配置
+      name: 'multi_onehot'    # 多个独立的 one-hot 分布
+      unimix_ratio: 0.01      # 均匀分布混合比例
+  
+  outscale: 0.01              # 输出层权重缩放因子（小初始化稳定训练）
+  symlog_inputs: False        # 是否对输入应用对称对数变换
+  name: 'actor'               # 模块名称
 
+# ----------------------------------------------------------------------------
+# Critic 价值网络配置
+# 根据潜在状态估计状态价值 V(s)
+# ----------------------------------------------------------------------------
 critic:
-  shape: [255,]
-  layers: 3
-  units: ${model.units}
-  act: ${model.act}
-  norm: ${model.norm}
-  device: ${device}
+  shape: [255,]               # TwoHot 分布的 bin 数量（255 个离散区间）
+  layers: 3                   # MLP 层数
+  units: ${model.units}       # 每层的神经元数量
+  act: ${model.act}           # 激活函数
+  norm: ${model.norm}         # 归一化方法
+  device: ${device}           # 计算设备
   dist:
-    name: 'symexp_twohot'
-    bin_num: 255
-  outscale: 0.0
-  symlog_inputs: False
-  name: 'value'
+    name: 'symexp_twohot'     # 分布类型：对称指数变换的 TwoHot 分布
+                              # 适合建模具有长尾分布的价值函数
+    bin_num: 255              # TwoHot 的 bin 数量
+  outscale: 0.0               # 输出层权重缩放因子（0 表示小初始化）
+  symlog_inputs: False        # 是否对输入应用对称对数变换
+  name: 'value'               # 模块名称

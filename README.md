@@ -1,5 +1,7 @@
 # R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
 
+> **完整文档**: 查看 [doc/comprehensive_readme.md](doc/comprehensive_readme.md) 获取详细的使用指南和DreamerV3对比分析
+
 This repository provides a PyTorch implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a computationally efficient world model that achieves high performance on continuous control benchmarks. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
 
 ## Instructions
@@ -33,6 +35,16 @@ python3 train.py model.rep_loss=r2dreamer
 ```
 
 For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
+
+## 📚 文档导航
+
+- **[综合README](doc/comprehensive_readme.md)** - 项目总览、快速开始、配置说明、常见问题
+- **[DreamerV3对比分析](doc/dreamerv3_comparison.md)** - 详细的架构对比、性能基准、实现差异
+- **[代码注释说明](doc/code_comments_guide.md)** - 所有关键文件的中文注释状态和阅读指南
+- **[项目架构详解](doc/project_architecture.md)** - 技术细节、数据流、调试技巧
+- **[快速参考手册](doc/quick_reference.md)** - 常用命令、故障排除、调参建议
+
+👉 **新手建议**: 从 [comprehensive_readme.md](doc/comprehensive_readme.md) 开始阅读
 
 
 ## Available Benchmarks

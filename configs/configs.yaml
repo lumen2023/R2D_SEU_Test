@@ -1,6 +1,7 @@
 defaults:
   - env: dmc_vision
   - model: size12M
+  - wandb  # 添加 W&B 配置
   # Disable Hydra's Python logging-to-file (train.log)
   - override hydra/job_logging: disabled
   - _self_
@@ -35,4 +36,6 @@ trainer:
   video_pred_log: False
   params_hist_log: False
   update_log_every: 5e3
+  checkpoint_every: 1e5
+  checkpoint_keep: 0
   action_repeat: ${env.action_repeat}

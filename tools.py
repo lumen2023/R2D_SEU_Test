@@ -28,12 +28,18 @@ class Tee(io.TextIOBase):
         # io.TextIOBase requires returning number of characters written.
         # Some streams may return None; we still return len(s).
         for stream in self._streams:
-            stream.write(s)
+            if getattr(stream, "closed", False):
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                stream.write(s)
         return len(s)
 
     def flush(self):
         for stream in self._streams:
-            stream.flush()
+            if getattr(stream, "closed", False):
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                stream.flush()
 
     def isatty(self):
         # Preserve tty detection for progress bars etc.
@@ -116,7 +122,15 @@ class CudaBenchmark:
 
 
 class Logger:
-    def __init__(self, logdir, filename="metrics.jsonl"):
+    """日志记录器：支持 TensorBoard、JSON 和 W&B
+    
+    Args:
+        logdir: 日志目录路径
+        filename: JSON 日志文件名
+        use_wandb: 是否启用 W&B
+        wandb_config: W&B 配置字典（project, name, config等）
+    """
+    def __init__(self, logdir, filename="metrics.jsonl", use_wandb=False, wandb_config=None):
         self._logdir = logdir
         self._filename = filename
         self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
@@ -126,9 +140,42 @@ class Logger:
         self._images = {}
         self._videos = {}
         self._histograms = {}
+        
+        # === W&B 初始化 ===
+        self._use_wandb = use_wandb
+        self._wandb = None
+        if use_wandb:
+            try:
+                import wandb
+                self._wandb = wandb
+                # 初始化 W&B run
+                wandb.init(
+                    project=wandb_config.get("project", "r2dreamer"),
+                    name=wandb_config.get("name", None),
+                    config=wandb_config.get("config", {}),
+                    dir=str(logdir),
+                    resume=wandb_config.get("resume", "allow"),
+                    tags=wandb_config.get("tags", [])
+                )
+                print(f"W&B initialized: {wandb.run.name} ({wandb.run.id})")
+            except ImportError:
+                print("Warning: wandb not installed. Install with: pip install wandb")
+                self._use_wandb = False
+            except Exception as e:
+                print(f"Warning: Failed to initialize W&B: {e}")
+                self._use_wandb = False
 
     def scalar(self, name, value):
+        """记录标量指标
+        
+        Args:
+            name: 指标名称（如 'episode/score'）
+            value: 指标值
+        """
         self._scalars[name] = float(value)
+        # 同步到 W&B（实时）
+        if self._use_wandb and self._wandb and self._last_step is not None:
+            self._wandb.log({name: value}, step=self._last_step)
 
     def image(self, name, value):
         self._images[name] = np.array(value)
@@ -140,12 +187,24 @@ class Logger:
         self._histograms[name] = np.array(value)
 
     def write(self, step, fps=False):
+        """写入所有缓存的日志数据
+        
+        Args:
+            step: 当前训练步数
+            fps: 是否计算并记录 FPS
+        """
         scalars = list(self._scalars.items())
         if fps:
             scalars.append(("fps/fps", self._compute_fps(step)))
+        
+        # 打印到控制台
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
+        
+        # 写入 JSON 文件
         with (self._logdir / self._filename).open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+        
+        # 写入 TensorBoard
         for name, value in scalars:
             if "/" not in name:
                 self._writer.add_scalar("scalars/" + name, value, step)
@@ -160,16 +219,44 @@ class Logger:
             B, T, H, W, C = value.shape
             value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
             self._writer.add_video(name, value, step, 16)
+            
+            # W&B 视频记录
+            if self._use_wandb and self._wandb:
+                try:
+                    # 转换为 W&B 视频格式 (T, C, H, W)
+                    wandb_video = value[0].transpose(0, 2, 3, 1)  # (T, H, W, C)
+                    self._wandb.log({
+                        name: self._wandb.Video(wandb_video, fps=16, format="mp4")
+                    }, step=step)
+                except Exception as e:
+                    print(f"Warning: Failed to log video to W&B: {e}")
+        
         for name, value in self._histograms.items():
             self._writer.add_histogram(name, value, step)
+            # W&B 直方图
+            if self._use_wandb and self._wandb:
+                self._wandb.log({name: self._wandb.Histogram(value)}, step=step)
 
         self._writer.flush()
+        
+        # W&B 批量记录标量（更可靠）
+        if self._use_wandb and self._wandb and scalars:
+            try:
+                self._wandb.log(dict(scalars), step=step)
+            except Exception as e:
+                print(f"Warning: Failed to log scalars to W&B: {e}")
+        
+        # 清空缓存
         self._scalars = {}
         self._images = {}
         self._videos = {}
+        self._histograms = {}
+        
+        # 更新最后步数（用于 W&B 实时记录）
+        self._last_step = step
 
     def _compute_fps(self, step):
-        if self._last_step is None:
+        if self._last_time is None:
             self._last_time = time.time()
             self._last_step = step
             return 0
@@ -179,6 +266,22 @@ class Logger:
         self._last_step = step
         return steps / duration
 
+    def finish(self):
+        """清理资源，关闭 W&B run 和 TensorBoard writer"""
+        # 关闭 TensorBoard writer
+        try:
+            self._writer.close()
+        except Exception as e:
+            print(f"Warning: Failed to close TensorBoard writer: {e}")
+        
+        # 关闭 W&B run
+        if self._use_wandb and self._wandb:
+            try:
+                self._wandb.finish()
+                print("W&B run finished.")
+            except Exception as e:
+                print(f"Warning: Failed to finish W&B: {e}")
+    
     def log_hydra_config(self, config, name="config", step=0, log_hparams=False, hparams_run_name="."):
         """
         Log a Hydra/OmegaConf config to TensorBoard:

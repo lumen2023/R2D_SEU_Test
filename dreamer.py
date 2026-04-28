@@ -18,29 +18,44 @@ from tools import to_f32
 
 
 class Dreamer(nn.Module):
+    """Dreamer V3 智能体主类
+    
+    实现基于世界模型的强化学习算法，包含以下核心组件：
+    1. 编码器(Encoder): 将原始观测编码为紧凑的潜在表示
+    2. RSSM: 循环状态空间模型，学习环境的动力学
+    3. 解码器(Decoder): 从潜在状态重建观测（可选）
+    4. Actor-Critic: 策略和价值网络，用于动作选择
+    5. 奖励和终止预测器: 预测环境反馈
+    
+    支持多种表征学习方法：
+    - dreamer: 传统的重构损失
+    - r2dreamer: Barlow Twins风格的冗余减少
+    - infonce: InfoNCE对比学习
+    - dreamerpro: 原型学习和数据增强
+    """
     def __init__(self, config, obs_space, act_space):
         super().__init__()
         self.device = torch.device(config.device)
-        self.act_entropy = float(config.act_entropy)
-        self.kl_free = float(config.kl_free)
-        self.imag_horizon = int(config.imag_horizon)
-        self.horizon = int(config.horizon)
-        self.lamb = float(config.lamb)
-        self.return_ema = networks.ReturnEMA(device=self.device)
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
-        self.rep_loss = str(config.rep_loss)
+        self.act_entropy = float(config.act_entropy)  # 动作熵系数，鼓励探索
+        self.kl_free = float(config.kl_free)  # KL散度的自由比特阈值
+        self.imag_horizon = int(config.imag_horizon)  # 想象轨迹的长度
+        self.horizon = int(config.horizon)  # MDP的折扣视界
+        self.lamb = float(config.lamb)  # TD(lambda)中的λ参数
+        self.return_ema = networks.ReturnEMA(device=self.device)  # 回报的指数移动平均
+        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)  # 动作维度
+        self.rep_loss = str(config.rep_loss)  # 表征损失类型
 
-        # World model components
+        # === 世界模型组件 ===
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
-        self.encoder = networks.MultiEncoder(config.encoder, shapes)
-        self.embed_size = self.encoder.out_dim
+        self.encoder = networks.MultiEncoder(config.encoder, shapes)  # 多模态编码器
+        self.embed_size = self.encoder.out_dim  # 嵌入维度
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
             self.act_dim,
-        )
-        self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)
-        self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)
+        )  # 循环状态空间模型
+        self.reward = networks.MLPHead(config.reward, self.rssm.feat_size)  # 奖励预测头
+        self.cont = networks.MLPHead(config.cont, self.rssm.feat_size)  # 继续概率预测头
 
         config.actor.shape = (act_space.n,) if hasattr(act_space, "n") else tuple(map(int, act_space.shape))
         self.act_discrete = False
@@ -53,15 +68,15 @@ class Dreamer(nn.Module):
         else:
             config.actor.dist = config.actor.dist.cont
 
-        # Actor-critic components
-        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
-        self.slow_target_update = int(config.slow_target_update)
-        self.slow_target_fraction = float(config.slow_target_fraction)
-        self._slow_value = copy.deepcopy(self.value)
+        # === Actor-Critic 组件 ===
+        self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)  # 策略网络
+        self.value = networks.MLPHead(config.critic, self.rssm.feat_size)  # 价值网络
+        self.slow_target_update = int(config.slow_target_update)  # 慢目标网络更新频率
+        self.slow_target_fraction = float(config.slow_target_fraction)  # 目标网络混合系数
+        self._slow_value = copy.deepcopy(self.value)  # 慢目标价值网络（用于稳定训练）
         for param in self._slow_value.parameters():
-            param.requires_grad = False
-        self._slow_value_updates = 0
+            param.requires_grad = False  # 冻结目标网络参数
+        self._slow_value_updates = 0  # 目标网络更新计数器
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads = bool(config.log_grads)
@@ -244,23 +259,33 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
-        """Policy inference step."""
+        """策略推理步骤：根据当前观测选择动作
+        
+        Args:
+            obs: 观测字典，形状为 (B, *)
+            state: RNN状态字典，包含 stoch、deter、prev_action
+            eval: 是否为评估模式（True则使用确定性动作）
+        
+        Returns:
+            action: 选择的动作，形状为 (B, A)
+            next_state: 更新后的RNN状态
+        """
         # obs: dict of (B, *), state: (stoch: (B, S, K), deter: (B, D), prev_action: (B, A))
         torch.compiler.cudagraph_mark_step_begin()
-        p_obs = self.preprocess(obs)
-        # (B, E)
+        p_obs = self.preprocess(obs)  # 预处理观测（如归一化图像）
+        # (B, E) - 编码观测为嵌入向量
         embed = self._frozen_encoder(p_obs)
         prev_stoch, prev_deter, prev_action = (
             state["stoch"],
             state["deter"],
             state["prev_action"],
         )
-        # (B, S, K), (B, D)
+        # (B, S, K), (B, D) - 后验状态更新
         stoch, deter, _ = self._frozen_rssm.obs_step(prev_stoch, prev_deter, prev_action, embed, obs["is_first"])
-        # (B, F)
+        # (B, F) - 拼接特征向量
         feat = self._frozen_rssm.get_feat(stoch, deter)
-        action_dist = self._frozen_actor(feat)
-        # (B, A)
+        action_dist = self._frozen_actor(feat)  # 计算动作分布
+        # (B, A) - 采样或选择最优动作
         action = action_dist.mode if eval else action_dist.rsample()
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
@@ -308,31 +333,38 @@ class Dreamer(nn.Module):
         return torch.cat([truth, model, error], 2)
 
     def update(self, replay_buffer):
-        """Sample a batch from replay and perform one optimization step."""
-        data, index, initial = replay_buffer.sample()
+        """从回放缓冲区采样一批数据并执行一次优化步骤
+        
+        Args:
+            replay_buffer: 经验回放缓冲区
+        
+        Returns:
+            metrics: 训练指标字典
+        """
+        data, index, initial = replay_buffer.sample()  # 采样批次数据
         torch.compiler.cudagraph_mark_step_begin()
-        p_data = self.preprocess(data)
-        self._update_slow_target()
+        p_data = self.preprocess(data)  # 预处理数据
+        self._update_slow_target()  # 更新慢目标网络
         if self.rep_loss == "dreamerpro":
-            self.ema_update()
+            self.ema_update()  # 更新EMA网络（DreamerPro专用）
         metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
-        self._scaler.unscale_(self._optimizer)  # unscale grads in params
+        with autocast(device_type=self.device.type, dtype=torch.float16):  # 混合精度训练
+            (stoch, deter), mets = self._cal_grad(p_data, initial)  # 计算梯度
+        self._scaler.unscale_(self._optimizer)  # 反缩放梯度
         if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
-            self._prototypes.grad.zero_()
+            self._prototypes.grad.zero_()  # 冻结原型的梯度
         if self._log_grads:
             old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads = [p.grad for p in self._named_params.values() if p.grad is not None]  # log grads before clipping
+            grads = [p.grad for p in self._named_params.values() if p.grad is not None]  # 记录裁剪前的梯度
             grad_norm = tools.compute_global_norm(grads)
             grad_rms = tools.compute_rms(grads)
             mets["opt/grad_norm"] = grad_norm
             mets["opt/grad_rms"] = grad_rms
-        self._agc(self._named_params.values())  # clipping
-        self._scaler.step(self._optimizer)  # update params
-        self._scaler.update()  # adjust scale
-        self._scheduler.step()  # increment scheduler
-        self._optimizer.zero_grad(set_to_none=True)  # reset grads
+        self._agc(self._named_params.values())  # AGC梯度裁剪
+        self._scaler.step(self._optimizer)  # 更新参数
+        self._scaler.update()  # 调整缩放因子
+        self._scheduler.step()  # 更新学习率调度器
+        self._optimizer.zero_grad(set_to_none=True)  # 重置梯度
         mets["opt/lr"] = self._scheduler.get_lr()[0]
         mets["opt/grad_scale"] = self._scaler.get_scale()
         if self._log_grads:
@@ -342,82 +374,95 @@ class Dreamer(nn.Module):
             mets["opt/param_rms"] = params_rms
             mets["opt/update_rms"] = update_rms
         metrics.update(mets)
-        # update latent vectors in replay buffer
+        # 更新回放缓冲区中的潜在向量
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
     def _cal_grad(self, data, initial):
-        """Compute gradients for one batch.
-
-        Notes
-        -----
-        This function computes:
-        1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates
-        4) Replay-based value learning
+        """计算一个批次的梯度
+        
+        该函数执行以下核心步骤：
+        1) 世界模型损失（动力学 + 表征）
+        2) 可选的表征损失变体（Dreamer、R2-Dreamer、InfoNCE、DreamerPro）
+        3) 想象轨迹 rollout 用于 actor-critic 更新
+        4) 基于回放的 value 学习
+        
+        Args:
+            data: 批次数据字典，形状为 (B, T, *)
+            initial: 初始状态元组 (stoch: (B, S, K), deter: (B, D))
+        
+        Returns:
+            (post_stoch, post_deter): 后验状态序列
+            metrics: 训练指标字典
         """
         # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D))
-        losses = {}
-        metrics = {}
-        B, T = data.shape
+        losses = {}  # 存储各项损失
+        metrics = {}  # 存储监控指标
+        B, T = data.shape  # 批次大小和时间步长
 
-        # === World model: posterior rollout and KL losses ===
-        # (B, T, E)
+        # === 世界模型：后验 rollout 和 KL 损失 ===
+        # (B, T, E) - 编码观测为嵌入向量
         embed = self.encoder(data)
-        # (B, T, S, K), (B, T, D), (B, T, S, K)
+        # (B, T, S, K), (B, T, D), (B, T, S, K) - 后验状态序列
         post_stoch, post_deter, post_logit = self.rssm.observe(embed, data["action"], initial, data["is_first"])
-        # (B, T, S, K)
+        # (B, T, S, K) - 先验状态 logits
         _, prior_logit = self.rssm.prior(post_deter)
+        # 计算动力学损失和表征损失的 KL 散度
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
-        losses["dyn"] = torch.mean(dyn_loss)
-        losses["rep"] = torch.mean(rep_loss)
-        # === Representation / auxiliary losses ===
-        # (B, T, F)
+        losses["dyn"] = torch.mean(dyn_loss)  # 动力学损失：鼓励后验接近先验
+        losses["rep"] = torch.mean(rep_loss)  # 表征损失：鼓励先验接近后验
+        # === 表征 / 辅助损失 ===
+        # (B, T, F) - 拼接特征向量
         feat = self.rssm.get_feat(post_stoch, post_deter)
         if self.rep_loss == "dreamer":
+            # Dreamer: 使用解码器重建观测
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key])) for key, dist in self.decoder(post_stoch, post_deter).items()
             }
             losses.update(recon_losses)
         elif self.rep_loss == "r2dreamer":
-            # R2-Dreamer: Barlow Twins style redundancy reduction between latent features and encoder embeddings.
-            # Flatten batch/time dims for a single cross-correlation matrix.
+            # R2-Dreamer: Barlow Twins 风格的冗余减少，在潜在特征和编码器嵌入之间
+            # 展平 batch/time 维度以计算单个互相关矩阵
             # (B, T, F) -> (B*T, F)
-            x1 = self.prj(feat[:, :].reshape(B * T, -1))
+            x1 = self.prj(feat[:, :].reshape(B * T, -1))  # 投影潜在特征
             # (B, T, E) -> (B*T, E)
-            x2 = embed.reshape(B * T, -1).detach()  # this detach is important
+            x2 = embed.reshape(B * T, -1).detach()  # 重要：这里需要 detach
 
+            # 标准化特征
             x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
             x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
 
+            # 计算互相关矩阵
             c = torch.mm(x1_norm.T, x2_norm) / (B * T)
+            # 不变性损失：对角线元素接近 1
             invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+            # 冗余减少损失：非对角线元素接近 0
             off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
             redundancy_loss = c[off_diag_mask].pow(2).sum()
             losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
         elif self.rep_loss == "infonce":
-            # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
+            # InfoNCE 对比学习目标：在投影的潜在特征和编码器嵌入之间
             # (B, T, F) -> (B*T, F)
             x1 = self.prj(feat[:, :].reshape(B * T, -1))
             # (B, T, E) -> (B*T, E)
-            x2 = embed.reshape(B * T, -1).detach()  # this detach is important
+            x2 = embed.reshape(B * T, -1).detach()  # 重要：这里需要 detach
+            # 计算相似度分数
             logits = torch.matmul(x1, x2.T)
-            norm_logits = logits - torch.max(logits, 1)[0][:, None]
-            labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
+            norm_logits = logits - torch.max(logits, 1)[0][:, None]  # 数值稳定化
+            labels = torch.arange(norm_logits.shape[0]).long().to(self.device)  # 正样本标签
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
         elif self.rep_loss == "dreamerpro":
-            # DreamerPro uses augmentation + EMA targets + Sinkhorn assignment.
+            # DreamerPro: 使用数据增强 + EMA 目标 + Sinkhorn 分配
             with torch.no_grad():
-                data_aug = self.augment_data(data)
+                data_aug = self.augment_data(data)  # 生成增强数据
                 initial_aug = (
                     # (B, ...) -> (2B, ...)
                     torch.cat([initial[0], initial[0]], dim=0),
                     torch.cat([initial[1], initial[1]], dim=0),
                 )
-                ema_proj = self.ema_proj(data_aug)
+                ema_proj = self.ema_proj(data_aug)  # EMA 网络投影
 
-            embed_aug = self.encoder(data_aug)
+            embed_aug = self.encoder(data_aug)  # 编码增强数据
             post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
                 embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
             )
@@ -426,90 +471,95 @@ class Dreamer(nn.Module):
         else:
             raise NotImplementedError
 
-        # reward and continue
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
-        cont = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
-        # log
-        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
-        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        # 奖励和继续概率预测
+        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))  # 奖励预测损失
+        cont = 1.0 - to_f32(data["is_terminal"])  # 继续概率（1 - 终止）
+        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))  # 继续概率预测损失
+        # 记录熵指标
+        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())  # 先验熵
+        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())  # 后验熵
 
-        # === Imagination rollout for actor-critic ===
-        # (B*T, S, K), (B*T, D)
+        # === 想象 rollout 用于 actor-critic ===
+        # (B*T, S, K), (B*T, D) - 重塑并分离梯度
         start = (
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
-        # (B, T, ...) -> (B*T, ...)
+        # (B, T, ...) -> (B*T, ...) - 在潜在空间中想象未来轨迹
         imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
-        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()  # 分离梯度
 
-        # (B*T, T_imag, 1)
+        # (B*T, T_imag, 1) - 预测想象轨迹的奖励
         imag_reward = self._frozen_reward(imag_feat).mode()
-        # (B*T, T_imag, 1)  probability of continuation
+        # (B*T, T_imag, 1) - 继续概率
         imag_cont = self._frozen_cont(imag_feat).mean
-        # (B*T, T_imag, 1)
+        # (B*T, T_imag, 1) - 价值估计
         imag_value = self._frozen_value(imag_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
-        disc = 1 - 1 / self.horizon
-        # (B*T, T_imag, 1)
+        imag_slow_value = self._frozen_slow_value(imag_feat).mode()  # 慢目标价值
+        disc = 1 - 1 / self.horizon  # 折扣因子
+        # (B*T, T_imag, 1) - 累积折扣权重
         weight = torch.cumprod(imag_cont * disc, dim=1)
         last = torch.zeros_like(imag_cont)
-        term = 1 - imag_cont
+        term = 1 - imag_cont  # 终止概率
+        # 计算 λ-return（广义优势估计的基础）
         ret = self._lambda_return(
             last, term, imag_reward, imag_value, imag_value, disc, self.lamb
         )  # (B*T, T_imag-1, 1)
-        ret_offset, ret_scale = self.return_ema(ret)
-        # (B*T, T_imag-1, 1)
+        ret_offset, ret_scale = self.return_ema(ret)  # 归一化回报
+        # (B*T, T_imag-1, 1) - 优势函数
         adv = (ret - imag_value[:, :-1]) / ret_scale
 
+        # 策略损失
         policy = self.actor(imag_feat)
-        # (B*T, T_imag-1, 1)
+        # (B*T, T_imag-1, 1) - 动作的对数概率
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
-        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
+        entropy = policy.entropy()[:, :-1].unsqueeze(-1)  # 动作熵
+        # 策略梯度损失：最大化期望回报 + 熵正则化
         losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
 
+        # 价值损失
         imag_value_dist = self.value(imag_feat)
-        # (B*T, T_imag, 1)
+        # (B*T, T_imag, 1) - 填充最后一个时间步
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        # 双重价值损失：同时拟合 return 和慢目标价值
         losses["value"] = torch.mean(
             weight[:, :-1].detach()
             * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
                 :, :-1
             ].unsqueeze(-1)
         )
-        # log
+        # 记录指标
         ret_normed = (ret - ret_offset) / ret_scale
-        metrics["ret"] = torch.mean(ret_normed)
-        metrics["ret_005"] = self.return_ema.ema_vals[0]
-        metrics["ret_095"] = self.return_ema.ema_vals[1]
-        metrics["adv"] = torch.mean(adv)
-        metrics["adv_std"] = torch.std(adv)
-        metrics["con"] = torch.mean(imag_cont)
-        metrics["rew"] = torch.mean(imag_reward)
-        metrics["val"] = torch.mean(imag_value)
-        metrics["tar"] = torch.mean(ret)
-        metrics["slowval"] = torch.mean(imag_slow_value)
-        metrics["weight"] = torch.mean(weight)
-        metrics["action_entropy"] = torch.mean(entropy)
-        metrics.update(tools.tensorstats(imag_action, "action"))
+        metrics["ret"] = torch.mean(ret_normed)  # 归一化回报均值
+        metrics["ret_005"] = self.return_ema.ema_vals[0]  # 5% 分位数
+        metrics["ret_095"] = self.return_ema.ema_vals[1]  # 95% 分位数
+        metrics["adv"] = torch.mean(adv)  # 优势均值
+        metrics["adv_std"] = torch.std(adv)  # 优势标准差
+        metrics["con"] = torch.mean(imag_cont)  # 平均继续概率
+        metrics["rew"] = torch.mean(imag_reward)  # 平均奖励
+        metrics["val"] = torch.mean(imag_value)  # 平均价值
+        metrics["tar"] = torch.mean(ret)  # 平均目标
+        metrics["slowval"] = torch.mean(imag_slow_value)  # 平均慢目标价值
+        metrics["weight"] = torch.mean(weight)  # 平均权重
+        metrics["action_entropy"] = torch.mean(entropy)  # 动作熵
+        metrics.update(tools.tensorstats(imag_action, "action"))  # 动作统计信息
 
-        # === Replay-based value learning (keep gradients through world model) ===
+        # === 基于回放的价值学习（保持通过世界模型的梯度） ===
         last, term, reward = (
             to_f32(data["is_last"]),
             to_f32(data["is_terminal"]),
             to_f32(data["reward"]),
         )
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        boot = ret[:, 0].reshape(B, T, 1)
-        value = self._frozen_value(feat).mode()
-        slow_value = self._frozen_slow_value(feat).mode()
-        disc = 1 - 1 / self.horizon
-        weight = 1.0 - last
-        ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
-        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+        boot = ret[:, 0].reshape(B, T, 1)  # bootstrap 值
+        value = self._frozen_value(feat).mode()  # 当前价值估计
+        slow_value = self._frozen_slow_value(feat).mode()  # 慢目标价值
+        disc = 1 - 1 / self.horizon  # 折扣因子
+        weight = 1.0 - last  # 权重（ episode 未结束时为 1）
+        ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)  # 计算 λ-return
+        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)  # 填充
 
-        # Keep this attached to the world model so gradients can flow through
+        # 保持与世界模型的连接，使梯度可以流过
         value_dist = self.value(feat)
         losses["repval"] = torch.mean(
             weight[:, :-1]
@@ -517,16 +567,17 @@ class Dreamer(nn.Module):
                 -1
             )
         )
-        # log
-        metrics.update(tools.tensorstats(ret, "ret_replay"))
-        metrics.update(tools.tensorstats(value, "value_replay"))
-        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+        # 记录指标
+        metrics.update(tools.tensorstats(ret, "ret_replay"))  # 回放中的回报统计
+        metrics.update(tools.tensorstats(value, "value_replay"))  # 回放中的价值统计
+        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))  # 回放中的慢目标价值统计
 
-        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
+        # 计算总损失并反向传播
+        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])  # 加权求和
+        self._scaler.scale(total_loss).backward()  # 缩放并反向传播
 
-        metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
-        metrics.update({"opt/loss": total_loss})
+        metrics.update({f"loss/{name}": loss for name, loss in losses.items()})  # 记录各项损失
+        metrics.update({"opt/loss": total_loss})  # 总损失
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()

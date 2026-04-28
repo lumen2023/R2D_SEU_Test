@@ -31,6 +31,11 @@ class ParallelEnv:
     def env_num(self):
         return len(self.envs)
 
+    def close(self):
+        for env in self.envs:
+            with contextlib.suppress(Exception):
+                env.close()
+
     def lift_dim(self, td):
         for key in td.keys():
             if td[key].ndim == 1:
@@ -140,6 +145,9 @@ class Worker:
         return self.impl.wait()
 
     def close(self):
+        with contextlib.suppress(Exception):
+            self.promise and self.promise()
+        self.promise = None
         self.impl.close()
 
 
@@ -157,6 +165,7 @@ class ProcessPipeWorker:
         self._process.start()
         self._nextid = 0
         self._results = {}
+        self._closed = False
         assert self._submit(Message.OK)()
         atexit.register(self.close)
 
@@ -167,13 +176,16 @@ class ProcessPipeWorker:
         pass
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         try:
             self._pipe.send((Message.STOP, self._nextid, None))
             self._pipe.close()
         except (AttributeError, OSError):
             pass  # The connection was already closed.
         try:
-            self._process.join(0.1)
+            self._process.join(5.0)
             if self._process.exitcode is None:
                 try:
                     os.kill(self._process.pid, 9)
@@ -218,6 +230,9 @@ class ProcessPipeWorker:
                     continue  # Wake up for keyboard interrupts.
                 message, callid, payload = pipe.recv()
                 if message == Message.STOP:
+                    with contextlib.suppress(Exception):
+                        if hasattr(state, "close"):
+                            state.close()
                     return
                 if message == Message.OK:
                     pipe.send((Message.RESULT, callid, True))

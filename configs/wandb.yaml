@@ -1,0 +1,8 @@
+# Weights & Biases 配置
+
+enabled: false          # 是否启用 W&B（默认关闭）
+project: r2dreamer      # W&B 项目名称
+entity: null            # 团队/组织名称（null 表示个人账户）
+name: null              # 实验运行名称（null 则自动生成）
+resume: allow           # 恢复策略：allow, must, never
+tags: []                # 标签列表，如 [dmc, r2dreamer, exp1]

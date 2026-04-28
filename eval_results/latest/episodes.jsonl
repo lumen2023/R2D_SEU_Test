@@ -1,0 +1,1 @@
+{"episode": 0, "reward": 144.4048309326172, "length": 159, "truncated_by_evaluator": false, "cost": 1.0, "event_cost": 1.0, "risk_field_cost": 0.0, "risk_field_event_equivalent_cost": 0.0, "success": 0.0, "safe_success": 0.0, "safe_route_completion": 0.0, "route_completion": 0.4091896712779999, "crash_vehicle": 0.0, "crash_object": 0.0, "out_of_road": 1.0, "max_step": 0.0}

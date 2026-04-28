@@ -4,7 +4,16 @@ import tools
 
 
 class OnlineTrainer:
-    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
+    def __init__(
+        self,
+        config,
+        replay_buffer,
+        logger,
+        logdir,
+        train_envs,
+        eval_envs,
+        checkpoint_saver=None,
+    ):
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
@@ -23,6 +32,20 @@ class OnlineTrainer:
         self._should_log = tools.Every(config.update_log_every)
         self._should_eval = tools.Every(self.eval_every)
         self._action_repeat = config.action_repeat
+        self.checkpoint_every = int(float(config.get("checkpoint_every", 0)))
+        self._next_checkpoint_step = self.checkpoint_every if self.checkpoint_every > 0 else None
+        self._checkpoint_saver = checkpoint_saver
+        self.current_step = 0
+        self.update_count = 0
+
+    def _maybe_save_checkpoint(self, agent, step, update_count):
+        if self._checkpoint_saver is None or self._next_checkpoint_step is None:
+            return
+        if step < self._next_checkpoint_step:
+            return
+        self._checkpoint_saver(agent, step, update_count, reason="periodic")
+        while self._next_checkpoint_step <= step:
+            self._next_checkpoint_step += self.checkpoint_every
 
     def eval(self, agent, train_step):
         """Run evaluation episodes.
@@ -78,8 +101,8 @@ class OnlineTrainer:
         self.logger.scalar("episode/eval_score", returns.mean())
         self.logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
         for key, value in log_metrics.items():
-            if key == "log_success":
-                value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
+            if key in ("log_success", "log_safe_success"):
+                value = torch.clip(value, max=1.0)  # keep binary episode flags bounded.
             self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
         if cache is not None and "image" in cache:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
@@ -108,6 +131,8 @@ class OnlineTrainer:
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
         update_count = 0
+        self.current_step = int(step)
+        self.update_count = int(update_count)
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
         returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
@@ -190,3 +215,10 @@ class OnlineTrainer:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
                     self.logger.write(step, fps=True)
+            self.current_step = int(step)
+            self.update_count = int(update_count)
+            self._maybe_save_checkpoint(agent, step, update_count)
+        return {
+            "step": int(step),
+            "update_count": int(update_count),
+        }

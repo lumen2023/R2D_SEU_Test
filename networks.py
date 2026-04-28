@@ -97,46 +97,72 @@ class RMSNorm2D(nn.RMSNorm):
 
 
 class MultiEncoder(nn.Module):
+    """多模态编码器：处理不同类型的观测
+    
+    支持两种类型的观测：
+    1. CNN观测：图像等3D输入（H, W, C）
+    2. MLP观测：向量等1D/2D输入
+    
+    最终将不同模态的特征拼接在一起。
+    """
     def __init__(
         self,
         config,
         shapes,
     ):
         super().__init__()
+        # 排除控制信号和日志字段
         excluded = ("is_first", "is_last", "is_terminal", "reward")
         shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_")}
+        
+        # 根据形状和配置正则表达式分类观测
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Encoder CNN shapes:", self.cnn_shapes)
         print("Encoder MLP shapes:", self.mlp_shapes)
 
-        self.out_dim = 0
-        self.selectors = []
-        self.encoders = []
+        self.out_dim = 0  # 输出维度
+        self.selectors = []  # 选择器函数列表
+        self.encoders = []   # 编码器列表
+        
+        # CNN编码器：处理图像观测
         if self.cnn_shapes:
-            input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
-            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
+            input_ch = sum([v[-1] for v in self.cnn_shapes.values()])  # 总通道数
+            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)  # (H, W, C)
             self.encoders.append(ConvEncoder(config.cnn, input_shape))
+            # 选择器：从观测字典中提取并拼接CNN观测
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
+        
+        # MLP编码器：处理向量观测
         if self.mlp_shapes:
-            inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
+            inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])  # 总输入维度
             self.encoders.append(MLP(config.mlp, inp_dim))
+            # 选择器：从观测字典中提取并拼接MLP观测
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
+        
         self.encoders = nn.ModuleList(self.encoders)
 
+        # 融合函数：根据编码器数量选择合适的方式
         if len(self.encoders) > 1:
-            self.fuser = lambda x: torch.cat(x, dim=-1)
+            self.fuser = lambda x: torch.cat(x, dim=-1)  # 拼接多个编码器的输出
         elif len(self.encoders) == 1:
-            self.fuser = lambda x: x[0]
+            self.fuser = lambda x: x[0]  # 单个编码器，直接返回
         else:
             raise NotImplementedError
 
         self.apply(weight_init_)
 
     def forward(self, obs):
-        """Encode a dict of observations."""
+        """编码观测字典
+        
+        Args:
+            obs: 观测字典，形状 dict of (B, T, *)
+        
+        Returns:
+            编码后的特征，形状 (B, T, out_dim)
+        """
         # dict of (B, T, *)
         return self.fuser([enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
 
@@ -190,14 +216,22 @@ class MultiDecoder(nn.Module):
 
 
 class ConvEncoder(nn.Module):
+    """卷积编码器：处理图像观测
+    
+    使用多层卷积+池化+归一化，逐步降低空间分辨率并增加通道数。
+    输出展平的特征向量。
+    """
     def __init__(self, config, input_shape):
         super().__init__()
         act = getattr(torch.nn, config.act)
         h, w, input_ch = input_shape
+        # 每层深度 = base_depth * multiplier
         self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
         self.kernel_size = int(config.kernel_size)
         in_dim = input_ch
         layers = []
+        
+        # 构建卷积层序列
         for i, depth in enumerate(self.depths):
             layers.append(
                 Conv2dSamePad(
@@ -208,29 +242,37 @@ class ConvEncoder(nn.Module):
                     bias=True,
                 )
             )
-            layers.append(nn.MaxPool2d(2, 2))
+            layers.append(nn.MaxPool2d(2, 2))  # 2x2池化，空间尺寸减半
             if config.norm:
-                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
-            layers.append(act())
+                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))  # RMS归一化
+            layers.append(act())  # 激活函数
             in_dim = depth
-            h, w = h // 2, w // 2
+            h, w = h // 2, w // 2  # 池化后尺寸减半
 
+        # 输出维度 = 最后通道数 * 最终高度 * 最终宽度
         self.out_dim = self.depths[-1] * h * w
         self.layers = nn.Sequential(*layers)
 
     def forward(self, obs):
-        """Encode image-like observations with a CNN."""
+        """使用CNN编码类图像观测
+        
+        Args:
+            obs: 图像观测，形状 (B, T, H, W, C)
+        
+        Returns:
+            编码特征，形状 (B, T, out_dim)
+        """
         # (B, T, H, W, C)
-        obs = obs - 0.5
-        # (B*T, H, W, C)
+        obs = obs - 0.5  # 归一化到 [-0.5, 0.5]
+        # (B*T, H, W, C) - 合并批次和时间维度
         x = obs.reshape(-1, *obs.shape[-3:])
-        # (B*T, C, H, W)
+        # (B*T, C, H, W) - 转换为channel-first格式
         x = x.permute(0, 3, 1, 2)
-        # (B*T, C_feat, H_feat, W_feat)
+        # (B*T, C_feat, H_feat, W_feat) - CNN编码
         x = self.layers(x)
-        # (B*T, C_feat*H_feat*W_feat)
+        # (B*T, C_feat*H_feat*W_feat) - 展平
         x = x.reshape(x.shape[0], -1)
-        # (B, T, C_feat*H_feat*W_feat)
+        # (B, T, C_feat*H_feat*W_feat) - 恢复批次和时间维度
         return x.reshape(*obs.shape[:-3], x.shape[-1])
 
 
