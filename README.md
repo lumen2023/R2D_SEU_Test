@@ -1,3 +1,6 @@
+# ⚠️ TEST ONLY - FOR PERSONAL USE ⚠️
+# 测试自用 - 请勿用于生产环境
+
 # R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
 
 > **完整文档**: 查看 [doc/comprehensive_readme.md](doc/comprehensive_readme.md) 获取详细的使用指南和DreamerV3对比分析
